@@ -28,6 +28,13 @@ min_max_sessions_per_instance=50
 
 perf_measure_user=$USER
 
+function nscp() {
+    PSSH_IAM_TOKEN=$BASTION_TOKEN nssh --bastion-user $BASTION_USER -u $BASTION_USER scp -p10 "$@"
+}
+function nrun() {
+    PSSH_IAM_TOKEN=$BASTION_TOKEN nssh --bastion-user $BASTION_USER -u $BASTION_USER run -p10 "$@"
+}
+
 usage() {
     echo "Usage: $0"
     echo "    --warehouses <N> \\"
@@ -60,8 +67,8 @@ kill_tpcc() {
         return
     fi
 
-    parallel-ssh -h $unique_hosts -i 'pkill -9 -f "^/bin/bash.*tpcc.sh"; pkill -9 -f "^java.*benchbase.jar -b tpcc"' &>/dev/null
-    parallel-ssh -h $unique_hosts -i "cd $tpcc_path && rm -rf results_*" &>/dev/null
+    nrun 'pkill -9 -f "^/bin/bash.*tpcc.sh"; pkill -9 -f "^java.*benchbase.jar -b tpcc"' $(cat $unique_hosts)
+    nrun "cd $tpcc_path && rm -rf results_*" $(cat $unique_hosts)
 }
 
 cleanup() {
@@ -74,8 +81,8 @@ cleanup() {
 
 trap cleanup SIGINT SIGTERM
 
-if ! which parallel-ssh >/dev/null; then
-    echo "parallel-ssh not found, you should install pssh"
+if ! which nssh >/dev/null; then
+    echo "nssh not found, you should nssh"
     exit 1
 fi
 
@@ -249,11 +256,11 @@ fi
 unique_hosts=`mktemp`
 sort -u $hosts_file > $unique_hosts
 
-# we need this hack to not force
-# user accept manually cluster hosts
-for host in `cat "$hosts_file" | sort -u`; do
-    ssh -o StrictHostKeyChecking=no $host &>/dev/null &
-done
+# # we need this hack to not force
+# # user accept manually cluster hosts
+# for host in `cat "$hosts_file" | sort -u`; do
+#     ssh -o StrictHostKeyChecking=no $host &>/dev/null &
+# done
 
 this_dir=`dirname $0`
 this_path=`readlink -f $this_dir`
@@ -279,14 +286,19 @@ if [[ -z "$viewer_url" ]]; then
     viewer_url="http://$ydb_host:8765"
 fi
 
+echo "tpcc_path = $tpcc_path"
+remote_tpcc_path="~/benchbase-ydb"
+
 tpcc_script="$tpcc_path/scripts/tpcc.sh"
-parallel-ssh -h $hosts_file -i 'test -e $tpcc_script || (echo tpcc.sh does not exist && exit 1)'
+nrun 'test -e $tpcc_script || (echo tpcc.sh does not exist && exit 1)' $(cat $hosts_file)
 if [ $? -ne 0 ]; then
     echo "$tpcc_script not found on some/all hosts, install benchbase (check our build and README)"
     exit 1
 fi
 
 gen_config_args=
+
+unique_hosts_homes=$(awk 1 ORS=':~ ' $unique_hosts)
 
 if [[ -n "$ca_file_path" ]]; then
     if [[ ! -r "$ca_file_path" ]]; then
@@ -296,7 +308,10 @@ if [[ -n "$ca_file_path" ]]; then
     log "Using CA file: $ca_file_path, enforcing secure connection"
     use_grpcs=1
 
-    parallel-scp -h $unique_hosts $ca_file_path $tpcc_path/ &>/dev/null
+    nscp $ca_file_path $unique_hosts_homes
+    nscp $tpcc_path $unique_hosts_homes
+    # parallel-scp -h $unique_hosts $ca_file_path $tpcc_path/ &>/dev/null
+
     if [[ $? -ne 0 ]]; then
         log "Failed to copy $ca_file_path file to the tpcc hosts"
         exit 1
@@ -316,7 +331,9 @@ if [[ -z "$YDB_ANONYMOUS_CREDENTIALS" ]]; then
         export YDB_TOKEN="$YDB_ACCESS_TOKEN_CREDENTIALS"
         export YDB_TOKEN_FILE="$token_file_path"
 
-        parallel-scp -h $unique_hosts $token_file_path $tpcc_path/ &>/dev/null
+        nscp $token_file_path $unique_hosts_homes
+        nscp $tpcc_path $unique_hosts_homes
+        # parallel-scp -h $unique_hosts $token_file_path $tpcc_path/ &>/dev/null
         if [[ $? -ne 0 ]]; then
             log "Failed to copy $token_file_path file to the tpcc hosts"
             exit 1
@@ -333,7 +350,9 @@ if [[ -z "$YDB_ANONYMOUS_CREDENTIALS" ]]; then
         export SA_KEY_FILE="$sa_key_file_path"
         export YDB_SERVICE_ACCOUNT_KEY_FILE_CREDENTIALS="$SA_KEY_FILE"
 
-        parallel-scp -h $unique_hosts $sa_key_file_path $tpcc_path/ &>/dev/null
+        nscp $sa_key_file_path $unique_hosts_homes
+        nscp $tpcc_path $unique_hosts_homes
+        # parallel-scp -h $unique_hosts $sa_key_file_path $tpcc_path/ &>/dev/null
         if [[ $? -ne 0 ]]; then
             log "Failed to copy $sa_key_file_path file to the tpcc hosts"
             exit 1
@@ -424,18 +443,22 @@ for host in `cat $hosts_file`; do
     config="config.$node_num.xml"
     node_num=$((node_num + 1))
 
-    scp $config ${host}:$tpcc_path/$config &
-    scp_pids+=($!)
-    log "Uploading config '$config' to $host, pid: ${scp_pids[-1]}"
-done
-
-for pid in "${scp_pids[@]}"; do
-    wait $pid
+    log "Uploading config '$config' to $host:$remote_tpcc_path/$config"
+    nscp $config $host:$remote_tpcc_path/$config
     if [ $? -ne 0 ]; then
-        log "Failed to upload config, pid=$pid"
+        echo "Failed to upload config to $host:$remote_tpcc_path/$config"
         exit 1
     fi
+    # scp_pids+=($!)
 done
+
+# for pid in "${scp_pids[@]}"; do
+#     wait $pid
+#     if [ $? -ne 0 ]; then
+#         log "Failed to upload config, pid=$pid"
+#         exit 1
+#     fi
+# done
 
 node_num=1
 for host in `cat $hosts_file`; do
@@ -495,6 +518,8 @@ if [[ -n "$disable_fast_log" ]]; then
 
     scheme_cmd_name=`basename $scheme_cmd`
     ydb_scheme_cmd="$ydb_bin_path -s $endpoint db schema execute $scheme_cmd_name"
+
+    echo "Something strange happens here ..."
     ssh $ydb_host_user@$ydb_host "$ydb_scheme_cmd"
     if [[ $? -ne 0 ]]; then
         log "Failed to execute fast log off scheme"
@@ -529,8 +554,7 @@ if [ -z "$no_load" ]; then
 
         log "Running tpcc initial load on $host (host_num=$host_num) with args: $args"
 
-        ssh $host "cd $tpcc_path && ./scripts/tpcc.sh --memory $java_memory -c $config $args" \
-            > $results_dir/$host.$host_num.load.log 2>&1 &
+        nrun "cd $remote_tpcc_path && ./scripts/tpcc.sh --memory $java_memory -c $config $args" $host > $results_dir/$host.$host_num.load.log 2>&1 &
         pids+=($!)
 
         host_num=`expr $host_num + 1`
@@ -610,7 +634,8 @@ done
 
 log "Cleaning up previous results"
 for host in `cat $hosts_file`; do
-    ssh $host "cd $tpcc_path && rm -rf results_*"
+    nrun "cd $remote_tpcc_path && rm -rf results_*" $host
+    # ssh $host "cd $tpcc_path && rm -rf results_*"
 done
 
 log "Running benchmark"
@@ -630,8 +655,10 @@ for host in `cat $hosts_file`; do
         args="$args --virtual-threads"
     fi
 
-    ssh $host "cd $tpcc_path && ./scripts/tpcc.sh --memory $java_memory -d results_${host_num} -c $config $args" \
+    nrun "cd $remote_tpcc_path && ./scripts/tpcc.sh --memory $java_memory -d results_${host_num} -c $config $args" $host \
         > $results_dir/$host/$host_num.run.log 2>&1 &
+    # ssh $host "cd $tpcc_path && ./scripts/tpcc.sh --memory $java_memory -d results_${host_num} -c $config $args" \
+    #     > $results_dir/$host/$host_num.run.log 2>&1 &
     pids+=($!)
     host_num=`expr $host_num + 1`
 done
@@ -687,8 +714,9 @@ log "Running benchmark done, copying results from the hosts"
 
 for host in `cat $hosts_file | sort -u`; do
     host_results="$results_dir/$host"
-    cd "$host_results"
-    scp -r $host:$tpcc_path/results_* ./
+    nscp $host:$remote_tpcc_path/results_* $host_results
+    # cd "$host_results"
+    # scp -r $host:$tpcc_path/results_* ./
     cd -
 done
 

@@ -3,6 +3,13 @@
 default_benchbase_url='https://storage.yandexcloud.net/ydb-benchmark-builds/benchbase-ydb.tgz'
 ssh_user="$USER"
 
+function nscp() {
+    PSSH_IAM_TOKEN=$BASTION_TOKEN nssh --bastion-user $BASTION_USER -u $BASTION_USER scp -p10 "$@"
+}
+function nrun() {
+    PSSH_IAM_TOKEN=$BASTION_TOKEN nssh --bastion-user $BASTION_USER -u $BASTION_USER run -p10 "$@"
+}
+
 usage() {
     echo "upload_benchbase.sh --hosts <hosts_file> [--package <benchbase-ydb>] [--package-url <url>] [--user <$ssh_user>]"
     echo "If you don't specify package and package-url, script will download benchbase from $benchbase_url"
@@ -16,13 +23,8 @@ cleanup() {
     fi
 }
 
-if ! which parallel-ssh >/dev/null; then
-    echo "parallel-ssh not found, you should install pssh"
-    exit 1
-fi
-
-if ! which parallel-scp >/dev/null; then
-    echo "parallel-ssh not found, you should install pssh"
+if ! which nssh >/dev/null; then
+    echo "nssh not found, you should install nssh"
     exit 1
 fi
 
@@ -78,20 +80,13 @@ sort -u $hosts > $unique_hosts
 
 trap cleanup EXIT
 
-# we need this hack to not force
-# user accept manually cluster hosts
-for host in `cat "$unique_hosts"`; do
-    if [[ -n "$ssh_user" ]]; then
-        host="$ssh_user@$host"
-    fi
-    ssh -o StrictHostKeyChecking=no $host &>/dev/null &
-done
 
-dst_home=$HOME
-if [[ -n "$ssh_user" ]]; then
-    host0=`head -n 1 $unique_hosts`
-    dst_home="`ssh $ssh_user@$host0 'echo $HOME'`"
-fi
+# dst_home=$HOME
+# if [[ -n "$ssh_user" ]]; then
+#     host0=`head -n 1 $unique_hosts`
+#     dst_home="`ssh $ssh_user@$host0 'echo $HOME'`"
+# fi
+dst_homes=$(awk 1 ORS=':~ ' $unique_hosts)
 
 if [[ -n "$package" ]]; then
     if [ ! -f "$package" ]; then
@@ -99,7 +94,9 @@ if [[ -n "$package" ]]; then
         exit 1
     fi
 
-    parallel-scp --user $ssh_user -h $unique_hosts $package $dst_home
+    nscp $package $dst_homes
+
+    # parallel-scp --user $ssh_user -h $unique_hosts $package $dst_home
     if [ $? -ne 0 ]; then
         echo "Failed to upload package $package to hosts $hosts"
         exit 1
@@ -107,14 +104,15 @@ if [[ -n "$package" ]]; then
 else
     package=`basename $benchbase_url`
 
-    parallel-ssh --user $ssh_user -h $unique_hosts "wget -O $package $benchbase_url"
+    nrun "wget -O $package $benchbase_url" $(cat $unique_hosts)
+
     if [ $? -ne 0 ]; then
         echo "Failed to download from $benchbase_url to hosts"
         exit 1
     fi
 fi
 
-parallel-ssh --user $ssh_user -h $unique_hosts "tar -xzf `basename $package`"
+nrun "tar -xzf `basename $package`" $(cat $unique_hosts)
 if [ $? -ne 0 ]; then
     echo "Failed to extract package $package on hosts $hosts"
     exit 1

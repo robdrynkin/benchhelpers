@@ -75,13 +75,12 @@ if [[ $? -ne 0 ]]; then
     some_failed=1
 fi
 
-"$common_dir"/copy_ssh_keys.sh --hosts "$hosts" &>/dev/null
-if [[ $? -ne 0 ]]; then
-    echo "Failed to copy ssh keys. Please copy them manually"
-    some_failed=1
-fi
 
-"$script_dir"/upload_benchbase.sh --hosts "$hosts"
+benchbase_url='https://storage.yandexcloud.net/ydb-benchmark-builds/benchbase-ydb.tgz'
+package=`basename $benchbase_url`
+wget -O $package $benchbase_url
+
+"$script_dir"/upload_benchbase.sh --hosts "$hosts" --package $package
 if [[ $? -ne 0 ]]; then
     echo "Failed to install tpcc. Please install it manually"
     some_failed=1
